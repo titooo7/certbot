@@ -2,7 +2,8 @@
 
 import glob
 
-from certbot import errors
+from acme.magic_typing import Optional  # pylint: disable=unused-import, no-name-in-module
+
 from certbot.compat import os
 
 from certbot_apache._internal import assertions
@@ -88,8 +89,6 @@ class ApacheDirectiveNode(ApacheParserNode):
         if self.name and self.name.lower() in ["include", "includeoptional"]:
             value = self.parameters[0]
             path = os.path.join(self.metadata['serverroot'], value)
-            if os.path.isdir(path):
-                path += "/*"                    # TODO (mona): test
             filepaths = glob.glob(path)
             for filepath in filepaths:
                 if filepath not in self.metadata['parsed_files']:
@@ -114,6 +113,25 @@ class ApacheDirectiveNode(ApacheParserNode):
         self._raw.value = tuple(" ".join(_parameters))
 
 
+def _recursive_generator(node, exclude=True, files_visited=None):
+    # iterator through children, and recursively expands through blocks and includes
+    if not files_visited:
+        files_visited = set([node.filepath])
+    for child in node.children:
+        yield child
+        if isinstance(child, ApacheBlockNode):
+            if not exclude or child.enabled:
+                for subchild in _recursive_generator(child, exclude, files_visited):
+                    yield subchild
+        if isinstance(child, ApacheDirectiveNode) and child.include:
+            for filename in child.include:
+                if filename not in files_visited:
+                    files_visited.add(filename)
+                    file_ast = node.metadata['parsed_files'][filename]
+                    for subchild in _recursive_generator(file_ast, exclude, files_visited):
+                        yield subchild
+
+
 def _pass_filter(block_node, apache_vars):
     filters = {
         "ifdefine": apache_vars["defines"],
@@ -128,25 +146,6 @@ def _pass_filter(block_node, apache_vars):
     loaded = (name in loaded_set)
     return expect_loaded == loaded
 
-def _recursive_generator(node, apache_vars, exclude=True, files_visited=None):
-    # iterator through children, and recursively expands through blocks and includes
-    if not files_visited:
-        files_visited = set([node.filepath])
-    for child in node.children:
-        yield child
-        if isinstance(child, ApacheBlockNode):
-            if not exclude or _pass_filter(child, apache_vars):
-                for subchild in _recursive_generator(child, apache_vars, exclude, files_visited):
-                    yield subchild
-        if isinstance(child, ApacheDirectiveNode) and child.include:
-            for filename in child.include:
-                if filename not in files_visited:
-                    files_visited.add(filename)
-                    file_ast = node.metadata['parsed_files'][filename]
-                    for subchild in _recursive_generator(file_ast, apache_vars,
-                                                         exclude, files_visited):
-                        yield subchild
-
 
 class ApacheBlockNode(ApacheDirectiveNode):
     """ apacheconfig implementation of BlockNode interface """
@@ -156,28 +155,24 @@ class ApacheBlockNode(ApacheDirectiveNode):
         self._raw_children = self._raw
         children = []
 
-        if self.name and self.name.lower() == "ifmodule":
-            module_name = self.parameters[0]
-            expect_loaded = not module_name.startswith("!")
-            module_name = module_name.lstrip("!")
-            loaded = (module_name in self.metadata["apache_vars"]["modules"])
-            self.enabled = self.enabled and expect_loaded == loaded
+        self.enabled = self.enabled and _pass_filter(self, self.metadata["apache_vars"])
 
         for raw_node in self._raw_children:
+            node = None  # type: Optional[ApacheParserNode]
             metadata = self.metadata.copy()
             metadata['ac_ast'] = raw_node
             if raw_node.typestring == "comment":
                 node = ApacheCommentNode(comment=raw_node.name[2:],
                                          metadata=metadata, ancestor=self,
                                          filepath=self.filepath)
-            elif raw_node.typestring == "block":  # TODO (mona) mypy annotations
+            elif raw_node.typestring == "block":
                 parameters = util.parameters_from_string(raw_node.arguments)
                 node = ApacheBlockNode(name=raw_node.tag, parameters=parameters,
                                        metadata=metadata, ancestor=self,
                                        filepath=self.filepath, enabled=self.enabled)
             else:
                 parameters = ()
-                if raw_node.value:  # TODO (mona) mypy annotations
+                if raw_node.value:
                     parameters = util.parameters_from_string(raw_node.value)
                 node = ApacheDirectiveNode(name=raw_node.name, parameters=parameters,
                                            metadata=metadata, ancestor=self,
@@ -185,7 +180,7 @@ class ApacheBlockNode(ApacheDirectiveNode):
             children.append(node)
         self.children = tuple(children)
 
-    def __eq__(self, other):  # TODO (mona): test
+    def __eq__(self, other):  # pragma: no cover
         if isinstance(other, self.__class__):
             return (self.name == other.name and
                     self.filepath == other.filepath and
@@ -232,7 +227,7 @@ class ApacheBlockNode(ApacheDirectiveNode):
     def find_blocks(self, name, exclude=True): # pylint: disable=unused-argument
         """Recursive search of BlockNodes from the sequence of children"""
         blocks = []
-        for child in _recursive_generator(self, self.metadata["apache_vars"], exclude=exclude):
+        for child in _recursive_generator(self, exclude=exclude):
             if isinstance(child, ApacheBlockNode) and child.name.lower() == name.lower():
                 blocks.append(child)
         return blocks
@@ -240,7 +235,7 @@ class ApacheBlockNode(ApacheDirectiveNode):
     def find_directives(self, name, exclude=True): # pylint: disable=unused-argument
         """Recursive search of DirectiveNodes from the sequence of children"""
         directives = []
-        for child in _recursive_generator(self, self.metadata["apache_vars"], exclude=exclude):
+        for child in _recursive_generator(self, exclude=exclude):
             if isinstance(child, ApacheDirectiveNode) and child.name.lower() == name.lower():
                 directives.append(child)
         return directives
@@ -248,7 +243,7 @@ class ApacheBlockNode(ApacheDirectiveNode):
     def find_comments(self, comment, exact=True): # pylint: disable=unused-argument
         """Recursive search of DirectiveNodes from the sequence of children"""
         comments = []
-        for child in _recursive_generator(self, self.metadata["apache_vars"]):
+        for child in _recursive_generator(self):
             # TODO: Is this the correct metric for matching comments?
             if isinstance(child, ApacheCommentNode) and comment in child.comment:
                 comments.append(child)
